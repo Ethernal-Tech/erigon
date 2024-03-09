@@ -23,16 +23,27 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math/big"
+	"os"
+	"path/filepath"
 	"reflect"
 	"runtime"
+	"strings"
 	"testing"
+	"time"
 
-	"github.com/ledgerwatch/erigon-lib/common/datadir"
-	"github.com/ledgerwatch/erigon/core/state/temporal"
+	"github.com/holiman/uint256"
 	"github.com/ledgerwatch/log/v3"
 
+	"github.com/ledgerwatch/erigon-lib/common/datadir"
+	"github.com/ledgerwatch/erigon-lib/kv"
+	"github.com/ledgerwatch/erigon/core"
+	"github.com/ledgerwatch/erigon/core/state"
+	"github.com/ledgerwatch/erigon/core/state/temporal"
+	"github.com/ledgerwatch/erigon/core/types"
 	"github.com/ledgerwatch/erigon/core/vm"
 	"github.com/ledgerwatch/erigon/eth/tracers/logger"
+	"github.com/ledgerwatch/erigon/turbo/rpchelper"
 )
 
 func TestState(t *testing.T) {
@@ -100,4 +111,164 @@ func withTrace(t *testing.T, test func(vm.Config) error) {
 	}
 	//t.Logf("EVM output: 0x%x", tracer.Output())
 	//t.Logf("EVM error: %v", tracer.Error())
+}
+
+func BenchmarkEVM(b *testing.B) {
+	// Walk the directory.
+	dir := benchmarksDir
+	dirinfo, err := os.Stat(dir)
+	if os.IsNotExist(err) || !dirinfo.IsDir() {
+		fmt.Fprintf(os.Stderr, "can't find test files in %s, did you clone the evm-benchmarks submodule?\n", dir)
+		b.Skip("missing test files")
+	}
+
+	_, db, _ := temporal.NewTestDB(b, datadir.New(b.TempDir()), nil)
+	err = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if info.IsDir() {
+			return nil
+		}
+		if ext := filepath.Ext(path); ext == ".json" {
+			name := filepath.ToSlash(strings.TrimPrefix(strings.TrimSuffix(path, ext), dir+string(filepath.Separator)))
+			b.Run(name, func(b *testing.B) { runBenchmarkFile(b, path, db) })
+		}
+		return nil
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+}
+
+func runBenchmarkFile(b *testing.B, path string, db kv.RwDB) {
+	m := make(map[string]StateTest)
+	if err := readJSONFile(path, &m); err != nil {
+		b.Fatal(err)
+		return
+	}
+	if len(m) != 1 {
+		b.Fatal("expected single benchmark in a file")
+		return
+	}
+	for _, t := range m {
+		t := t
+		runBenchmark(b, &t, db)
+	}
+}
+
+func runBenchmark(b *testing.B, t *StateTest, db kv.RwDB) {
+	for _, subtest := range t.Subtests() {
+		subtest := subtest
+		key := fmt.Sprintf("%s/%d", subtest.Fork, subtest.Index)
+
+		b.Run(key, func(b *testing.B) {
+			vmconfig := vm.Config{}
+
+			config, eips, err := GetChainConfig(subtest.Fork)
+			if err != nil {
+				b.Error(err)
+				return
+			}
+
+			vmconfig.ExtraEips = eips
+			block, _, err := core.GenesisToBlock(t.genesis(config), "", log.Root())
+			if err != nil {
+				b.Error(err)
+				return
+			}
+
+			tx, err := db.BeginRw(context.Background())
+			if err != nil {
+				b.Error(err)
+				return
+			}
+			defer tx.Rollback() // TODO: Check
+
+			rules := config.Rules(0, 0)
+			_, err = MakePreState(rules, tx, t.json.Pre, block.NumberU64())
+			if err != nil {
+				b.Error(err)
+				return
+			}
+
+			r := rpchelper.NewLatestStateReader(tx)
+			statedb := state.New(r)
+
+			var baseFee *big.Int
+			if rules.IsLondon {
+				baseFee = t.json.Env.BaseFee
+				if baseFee == nil {
+					// Retesteth uses `0x10` for genesis baseFee. Therefore, it defaults to
+					// parent - 2 : 0xa as the basefee for 'this' context.
+					baseFee = big.NewInt(0x0a)
+				}
+			}
+			post := t.json.Post[subtest.Fork][subtest.Index]
+			msg, err := toMessage(t.json.Tx, post, baseFee)
+			if err != nil {
+				b.Error(err)
+				return
+			}
+
+			// Try to recover tx with current signer
+			if len(post.Tx) != 0 {
+				ttx, err := types.UnmarshalTransactionFromBinary(post.Tx, false)
+				if err != nil {
+					b.Error(err)
+					return
+				}
+
+				msg, err = ttx.AsMessage(*types.MakeSigner(config, 0, 0), baseFee, config.Rules(0, 0))
+				if err != nil {
+					b.Error(err)
+					return
+				}
+			}
+
+			// Prepare the EVM.
+			txContext := core.NewEVMTxContext(msg)
+			header := block.Header()
+			context := core.NewEVMBlockContext(header, core.GetHashFn(header, nil), nil, &t.json.Env.Coinbase)
+			context.GetHash = vmTestBlockHash
+			if baseFee != nil {
+				context.BaseFee = new(uint256.Int)
+				context.BaseFee.SetFromBig(baseFee)
+			}
+			evm := vm.NewEVM(context, txContext, statedb, config, vmconfig)
+
+			// Create "contract" for sender to cache code analysis.
+			sender := vm.NewContract(vm.AccountRef(msg.From()), msg.From(), nil, 0, false)
+
+			var (
+				gasUsed uint64
+				elapsed uint64
+				refund  uint64
+			)
+			b.ResetTimer()
+			for n := 0; n < b.N; n++ {
+				snapshot := statedb.Snapshot()
+				statedb.Prepare(rules, msg.From(), context.Coinbase, msg.To(), vm.ActivePrecompiles(rules), msg.AccessList())
+				b.StartTimer()
+				start := time.Now()
+
+				// Execute the message.
+				_, leftOverGas, err := evm.Call(sender, *msg.To(), msg.Data(), msg.Gas(), msg.Value(), false)
+				if err != nil {
+					b.Error(err)
+					return
+				}
+
+				b.StopTimer()
+				elapsed += uint64(time.Since(start))
+				refund += statedb.GetRefund()
+				gasUsed += msg.Gas() - leftOverGas
+
+				statedb.RevertToSnapshot(snapshot)
+			}
+			if elapsed < 1 {
+				elapsed = 1
+			}
+			// Keep it as uint64, multiply 100 to get two digit float later
+			mgasps := (100 * 1000 * (gasUsed - refund)) / elapsed
+			b.ReportMetric(float64(mgasps)/100, "mgas/s")
+		})
+	}
 }
